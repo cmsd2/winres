@@ -56,6 +56,8 @@ use std::error::Error;
 
 extern crate toml;
 
+pub mod sdk;
+
 /// Version info field names
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub enum VersionInfo {
@@ -80,7 +82,7 @@ pub enum VersionInfo {
 
 #[derive(Debug)]
 pub struct WindowsResource {
-    toolkit_path: PathBuf,
+    tool: sdk::Tool,
     properties: HashMap<String, String>,
     version_info: HashMap<VersionInfo, u64>,
     rc_file: Option<String>,
@@ -144,20 +146,20 @@ impl WindowsResource {
         let mut ver: HashMap<VersionInfo, u64> = HashMap::new();
 
         props.insert("FileVersion".to_string(),
-                     env::var("CARGO_PKG_VERSION").unwrap().to_string());
+                     env::var("CARGO_PKG_VERSION").expect("env").to_string());
         props.insert("ProductVersion".to_string(),
-                     env::var("CARGO_PKG_VERSION").unwrap().to_string());
+                     env::var("CARGO_PKG_VERSION").expect("env").to_string());
         props.insert("ProductName".to_string(),
-                     env::var("CARGO_PKG_NAME").unwrap().to_string());
+                     env::var("CARGO_PKG_NAME").expect("env").to_string());
         props.insert("FileDescription".to_string(),
-                     env::var("CARGO_PKG_DESCRIPTION").unwrap().to_string());
+                     env::var("CARGO_PKG_DESCRIPTION").expect("env").to_string());
 
-        parse_cargo_toml(&mut props).unwrap();
+        parse_cargo_toml(&mut props).expect("parse toml");
 
         let mut version = 0 as u64;
-        version |= env::var("CARGO_PKG_VERSION_MAJOR").unwrap().parse().unwrap_or(0) << 48;
-        version |= env::var("CARGO_PKG_VERSION_MINOR").unwrap().parse().unwrap_or(0) << 32;
-        version |= env::var("CARGO_PKG_VERSION_PATCH").unwrap().parse().unwrap_or(0) << 16;
+        version |= env::var("CARGO_PKG_VERSION_MAJOR").expect("env").parse().unwrap_or(0) << 48;
+        version |= env::var("CARGO_PKG_VERSION_MINOR").expect("env").parse().unwrap_or(0) << 32;
+        version |= env::var("CARGO_PKG_VERSION_PATCH").expect("env").parse().unwrap_or(0) << 16;
         // version |= env::var("CARGO_PKG_VERSION_PRE").unwrap().parse().unwrap_or(0);
         ver.insert(VersionInfo::FILEVERSION, version);
         ver.insert(VersionInfo::PRODUCTVERSION, version);
@@ -167,17 +169,16 @@ impl WindowsResource {
         ver.insert(VersionInfo::FILEFLAGSMASK, 0x3F);
         ver.insert(VersionInfo::FILEFLAGS, 0);
 
-        let sdk = if cfg!(target_env = "msvc") {
-            match get_sdk() {
-                Ok(mut v) => v.pop().unwrap(),
-                Err(_) => PathBuf::new(),
-            }
+        let tool = if cfg!(target_env = "msvc") {
+            get_sdk().expect("get_sdk")
+        } else if cfg!(target_os = "windows") {
+            unimplemented!()
         } else {
-            PathBuf::from("\\")
+            unimplemented!()
         };
 
         WindowsResource {
-            toolkit_path: sdk,
+            tool: tool,
             properties: props,
             version_info: ver,
             rc_file: None,
@@ -219,7 +220,7 @@ impl WindowsResource {
         self
     }
 
-    /// Set the correct path for the toolkit.
+    /// Set the correct tool.
     ///
     /// For the GNU toolkit this has to be the path where MinGW
     /// put `windres.exe` and `ar.exe`. This could be something like:
@@ -234,8 +235,8 @@ impl WindowsResource {
     ///
     /// If it is left unset, it will look up a path in the registry,
     /// i.e. `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`
-    pub fn set_toolkit_path<'a>(&mut self, path: &'a str) -> &mut Self {
-        self.toolkit_path = PathBuf::from(path);
+    pub fn set_tool<'a>(&mut self, tool: sdk::Tool) -> &mut Self {
+        self.tool = tool;
         self
     }
 
@@ -255,7 +256,7 @@ impl WindowsResource {
     ///         winapi::um::winnt::LANG_ENGLISH,
     ///         winapi::um::winnt::SUBLANG_ENGLISH_US
     ///     ));
-    ///     res.compile().unwrap();
+    ///     res.compile().expect("compile");
     ///   }
     /// }
     /// ```
@@ -451,7 +452,7 @@ impl WindowsResource {
         let windres_path = self.windres_path.as_ref().map_or("windres.exe", String::as_str);
         let status = process::Command::new(windres_path)
             .current_dir(&self.toolkit_path)
-            .arg(format!("-I{}", env::var("CARGO_MANIFEST_DIR").unwrap()))
+            .arg(format!("-I{}", env::var("CARGO_MANIFEST_DIR").expect("env")))
             .arg(format!("{}", input.display()))
             .arg(format!("{}", output.display()))
             .status()?;
@@ -496,37 +497,43 @@ impl WindowsResource {
         let rc = if let Some(s) = self.rc_file.as_ref() {
             s.clone()
         } else {
-            rc.to_str().unwrap().to_string()
+            rc.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "utf8 decode"))?.to_string()
         };
         self.compile_with_toolkit(rc.as_str(), &self.output_directory)?;
 
         Ok(())
     }
 
+    pub fn tool_path<'a>(&'a self) -> io::Result<&'a Path> {
+        Ok(&self.tool.path)
+    }
+
+    pub fn include_dirs<'a>(&'a self) -> Vec<&Path> {
+        self.tool.include_dirs.values().map(PathBuf::as_path).collect()
+    }
+
     #[cfg(target_env = "msvc")]
     fn compile_with_toolkit<'a>(&self, input: &'a str, output_dir: &'a str) -> io::Result<()> {
-        let rc_exe = PathBuf::from(&self.toolkit_path).join("rc.exe");
-        let rc_exe = if !rc_exe.exists() {
-            if cfg!(target_arch = "x86_64") {
-                PathBuf::from(&self.toolkit_path).join(r"bin\x64\rc.exe")
-            } else {
-                PathBuf::from(&self.toolkit_path).join(r"bin\x86\rc.exe")
-            }
-        } else {
-            rc_exe
-        };
-        // let inc_win = PathBuf::from(&self.toolkit_path).join("Include\\10.0.10586.0\\um");
-        // let inc_shared = PathBuf::from(&self.toolkit_path).join("Include\\10.0.10586.0\\shared");
+        let rc_exe = self.tool_path()?;
+
         let output = PathBuf::from(output_dir).join("resource.lib");
         let input = PathBuf::from(input);
+
+        let mut args = vec![];
+        args.push(format!("/I{}", env::var("CARGO_MANIFEST_DIR").expect("env")));
+        
+        for inc in self.include_dirs() {
+            args.push(format!("/I{}", inc.to_str().ok_or_else(||
+                    io::Error::new(io::ErrorKind::Other, "unicode serialisation"))?));
+        }
+
+        args.push(format!("/fo{}", output.display()));
+        args.push(format!("{}", input.display()));
+
         let status = process::Command::new(rc_exe)
-            .arg(format!("/I{}", env::var("CARGO_MANIFEST_DIR").unwrap()))
-            //.arg(format!("/I{}", inc_shared.display()))
-            //.arg(format!("/I{}", inc_win.display()))
-            //.arg("/nologo")
-            .arg(format!("/fo{}", output.display()))
-            .arg(format!("{}", input.display()))
+            .args(&args)
             .output()?;
+        
         println!("RC Output:\n{}\n------", String::from_utf8_lossy(&status.stdout));
         println!("RC Error:\n{}\n------", String::from_utf8_lossy(&status.stderr));
         if !status.status.success() {
@@ -545,58 +552,27 @@ impl WindowsResource {
 }
 
 /// Find a Windows SDK
-fn get_sdk() -> io::Result<Vec<PathBuf>> {
+fn get_sdk() -> io::Result<sdk::Tool> {
     // use the reg command, so we don't need a winapi dependency
-    let output = process::Command::new("reg")
-        .arg("query")
-        .arg(r"HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots")
-        .arg("/reg:32")
-        .output()?;
+    let system = sdk::System::new()?;
+    let env_version = env::var("WindowsSDKVersion").ok();
+    let arch = sdk::Arch::arch_for_cfg_target()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "unsupported target arch"))?;
+    let tools =  system.sdks.iter().filter_map(|sdk| sdk.tool("rc.exe", arch)).collect::<Vec<_>>();
 
-    let lines = String::from_utf8(output.stdout)
-        .or_else(|e| Err(io::Error::new(io::ErrorKind::Other, e.description())))?;
-    let mut kits: Vec<PathBuf> = Vec::new();
-    let mut lines: Vec<&str> = lines.lines().collect();
-    lines.reverse();
-    for line in lines {
-        if line.trim().starts_with("KitsRoot") {
-            let kit: String = line.chars()
-                .skip(line.find("REG_SZ").unwrap() + 6)
-                .skip_while(|c| c.is_whitespace())
-                .collect();
+    let max_version = tools.iter().max_by(|a,b| a.sdk_version.cmp(&b.sdk_version));
 
-            let p = PathBuf::from(&kit);
-            let rc = if cfg!(target_arch = "x86_64") {
-                p.join(r"bin\x64\rc.exe")
-            } else {
-                p.join(r"bin\x86\rc.exe")
-            };
+    let tool = tools.iter().find(|tool| {
+        env_version.as_ref().map(|ev| ev == &tool.sdk_version).unwrap_or(false)
+    }).or_else(|| max_version);
 
-            if rc.exists() {
-                println!("{:?}", rc);
-                kits.push(rc.parent().unwrap().to_owned());
-            }
-
-            if let Ok(bin) = p.join("bin").read_dir() {
-                for e in bin.filter_map(|e| e.ok())  {
-                    let p = if cfg!(target_arch = "x86_64") {
-                        e.path().join(r"x64\rc.exe")
-                    } else {
-                        e.path().join(r"x86\rc.exe")
-                    };
-                    if p.exists() {
-                        println!("{:?}", p);
-                        kits.push(p.parent().unwrap().to_owned());
-                    }
-                }
-            }
-        }
-    }
-    Ok(kits)
+    tool.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, format!("no rc.exe tool found for arch {} in {:?}", arch, system.installed_roots))
+    }).map(std::borrow::ToOwned::to_owned)
 }
 
 fn parse_cargo_toml(props: &mut HashMap<String, String>) -> io::Result<()> {
-    let cargo = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("Cargo.toml");
+    let cargo = Path::new(&env::var("CARGO_MANIFEST_DIR").expect("env")).join("Cargo.toml");
     let mut f = fs::File::open(cargo)?;
     let mut cargo_toml = String::new();
     f.read_to_string(&mut cargo_toml)?;
@@ -631,7 +607,7 @@ fn parse_cargo_toml(props: &mut HashMap<String, String>) -> io::Result<()> {
     Ok(())
 }
 
-fn escape_string(string: &str) -> String {
+pub(crate) fn escape_string(string: &str) -> String {
     let mut escaped = String::new();
     for chr in string.chars() {
         // In quoted RC strings, double-quotes are escaped by using two
@@ -653,6 +629,7 @@ fn escape_string(string: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::escape_string;
+    use super::get_sdk;
 
     #[test]
     fn string_escaping() {
@@ -661,5 +638,12 @@ mod tests {
         assert_eq!(&escape_string("\"Hello\""), "\"\"Hello\"\"");
         assert_eq!(&escape_string("C:\\Program Files\\Foobar"),
                    "C:\\\\Program Files\\\\Foobar");
+    }
+
+    #[cfg(target_env = "msvc")]
+    #[test]
+    fn test_get_sdk() {
+        let tool = get_sdk().expect("get_sdk");
+        println!("{:?}", tool);
     }
 }

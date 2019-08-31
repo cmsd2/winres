@@ -8,7 +8,7 @@ repository = "https://github.com/mxre/winres"
 documentation= "https://docs.rs/winres/*/winres/"
 
 [lib]
-path = "lib.rs"
+
 
 [dependencies]
 toml = "0.5"
